@@ -1,0 +1,47 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "REEP API (debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["app.main:app", "--port", "3300"],
+      "cwd": "${workspaceFolder}/apps/api-py",
+      "python": "C:/Users/Developer/.venvs/reep/Scripts/python.exe",
+      "env": { "PYTHONIOENCODING": "utf-8" },
+      "justMyCode": true,
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Student leave: guided run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "C:/Users/Developer/AppData/Local/Temp/claude/5a1aaa4300122687/05e59bbc-3989-4373-bf8a-c6103183cb91/scratchpad/debug_student_leave.py",
+      "cwd": "${workspaceFolder}/apps/api-py",
+      "python": "C:/Users/Developer/.venvs/reep/Scripts/python.exe",
+      "env": { "PYTHONPATH": "${workspaceFolder}/apps/api-py", "PYTHONIOENCODING": "utf-8" },
+      "justMyCode": true,
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Student leave: tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests/test_student_leave.py", "-q", "-p", "no:cacheprovider"],
+      "cwd": "${workspaceFolder}/apps/api-py",
+      "python": "C:/Users/Developer/.venvs/reep/Scripts/python.exe",
+      "env": { "REEP_REQUIRE_DB": "1", "PYTHONIOENCODING": "utf-8" },
+      "justMyCode": true,
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "REEP web (Chrome)",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://localhost:4200",
+      "webRoot": "${workspaceFolder}/apps/web"
+    }
+  ]
+}
