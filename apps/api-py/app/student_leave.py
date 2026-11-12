@@ -47,6 +47,14 @@ from .models.user import Mentor, Role, Student, User
 #: through an option the form does not print.
 STUDENT_LEAVE_KINDS: Final[tuple[str, ...]] = ("MEDICAL", "CASUAL", "OOD")
 
+#: The one kind that must arrive with a supporting document, and keep it while
+#: the request is pending (`routers/leave_attachments.py::delete_attachment`).
+MEDICAL: Final = "MEDICAL"
+MEDICAL_NEEDS_DOCUMENT: Final = (
+    "Medical leave needs a supporting document. "
+    "Attach your medical certificate and send the request again."
+)
+
 ROUTED_TO_MENTOR: Final = "MENTOR"
 ROUTED_TO_OFFICE: Final = "OFFICE"
 
@@ -100,12 +108,22 @@ def student_submit_refusal(
     leave_kind: str | None,
     from_date: date,
     to_date: date,
+    with_document: bool = False,
 ) -> str | None:
     """The sentence a STUDENT's request is refused with, or None.
 
     The leave type is required and is one of `STUDENT_LEAVE_KINDS`: the staff
     options (permission, restricted holiday, loss of pay) are about a staff
     contract a student does not have.
+
+    MEDICAL LEAVE COMES WITH ITS DOCUMENT (2026-11-12). `with_document` says
+    whether a supporting document arrives IN THE SAME CALL as the request —
+    `POST /api/leaves/student` (`routers/leave_attachments.py`), which saves
+    both in one transaction. The JSON `POST /api/leaves` carries no file, so a
+    student's MEDICAL request sent there is refused: accepting it would let
+    the document rule be skipped by calling the API directly, and attaching
+    afterwards is the two-step path that left requests without their document
+    when the second step failed.
 
     And no two live requests for the same day. `leave_policy.submit_refusal`
     checks overlap only once the office has recorded an allowance, so a staff
@@ -115,6 +133,8 @@ def student_submit_refusal(
     """
     if leave_kind not in STUDENT_LEAVE_KINDS:
         return "Choose the type of leave: Medical, Casual or On official duty."
+    if leave_kind == MEDICAL and not with_document:
+        return MEDICAL_NEEDS_DOCUMENT
     clash = overlapping_request(db, user_id, from_date, to_date)
     if clash is not None:
         return (

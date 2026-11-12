@@ -65,14 +65,24 @@
       </div>
     </div>
 
-    <div class="document field">
-      <label for="leave-document">Supporting document <span class="optional">(optional)</span></label>
+    <div class="document field" [class.invalid]="documentError()">
+      <label for="leave-document">
+        Supporting document
+        @if (needsDocument()) {
+          <span class="req" aria-hidden="true">*</span>
+        } @else {
+          <span class="optional">(optional)</span>
+        }
+      </label>
       <label class="dropzone">
         <input
           id="leave-document"
           class="file-input"
           type="file"
           accept="application/pdf,image/png,image/jpeg"
+          [attr.aria-required]="needsDocument()"
+          [attr.aria-invalid]="documentError() ? true : null"
+          [attr.aria-describedby]="documentError() ? 'leave-document-error' : null"
           (change)="pickFile($event)"
         />
         <span class="icon" aria-hidden="true">upload_file</span>
@@ -80,10 +90,15 @@
           <span class="file-name">{{ f.name }}</span>
           <span class="hint">Choose another file to replace it</span>
         } @else {
-          <span>Choose a file to upload</span>
-          <span class="hint">PDF, PNG or JPG, up to 10 MB</span>
+          <span>{{ needsDocument() ? 'Choose your medical certificate' : 'Choose a file to upload' }}</span>
+          <span class="hint">
+            PDF, PNG or JPG, up to 10 MB{{ needsDocument() ? ' · required for medical leave' : '' }}
+          </span>
         }
       </label>
+      @if (documentError(); as message) {
+        <div id="leave-document-error" class="field-error" role="alert">{{ message }}</div>
+      }
       @if (file()) {
         <button type="button" class="btn sm ghost" (click)="removeFile()">
           <span class="icon" aria-hidden="true">close</span>Remove file

@@ -8,6 +8,12 @@
  * of a mentored student's request). The reason and any supporting document
  * open on the row, with a note to the student: required to reject (the
  * server refuses a blank one too), optional to approve (2026-11-06).
+ *
+ * REJECTING IS CONFIRMED (2026-11-12). With a reason typed, Reject does not
+ * send anything: it turns the row's buttons into Keep / Confirm reject, the
+ * same pattern My leave uses for Withdraw, and only Confirm records it.
+ * Editing the reason, opening another row or switching tabs drops the
+ * confirmation, so what is confirmed is always the reason on screen.
  */
 
 import { Component, signal } from '@angular/core';
@@ -61,6 +67,8 @@ export class StudentLeaveComponent {
   /** The note to the student on the open row. */
   readonly note = signal('');
   readonly noteError = signal<string | null>(null);
+  /** The row waiting for "Confirm reject", or null. */
+  readonly confirmingReject = signal<string | null>(null);
 
   constructor() {
     void this.load();
@@ -70,6 +78,7 @@ export class StudentLeaveComponent {
     if (tab === this.tab()) return;
     this.tab.set(tab);
     this.open.set(null);
+    this.confirmingReject.set(null);
     this.notice.set(null);
     await this.load();
   }
@@ -95,15 +104,27 @@ export class StudentLeaveComponent {
     this.open.update((id) => (id === row.id ? null : row.id));
     this.note.set('');
     this.noteError.set(null);
+    this.confirmingReject.set(null);
   }
 
-  /** Reject needs a reason: with none typed, open the row at the note box. */
+  /** The note box changed: clear its error, and any confirmation given for
+   *  the reason it held before. */
+  setNote(value: string): void {
+    this.note.set(value);
+    this.noteError.set(null);
+    this.confirmingReject.set(null);
+  }
+
+  /** Reject needs a reason: with none typed, open the row at the note box.
+   *  With one, ask for confirmation; `confirmReject` sends it. */
   reject(row: MenteeLeaveRow): void {
     const typed = this.open() === row.id ? this.note().trim() : '';
     if (typed) {
-      void this.decide(row, 'REJECT', typed);
+      this.noteError.set(null);
+      this.confirmingReject.set(row.id);
       return;
     }
+    this.confirmingReject.set(null);
     if (this.open() !== row.id) {
       this.open.set(row.id);
       this.note.set('');
@@ -112,7 +133,24 @@ export class StudentLeaveComponent {
     setTimeout(() => document.getElementById(`leave-note-${row.id}`)?.focus());
   }
 
+  /** "Confirm reject": send the rejection with the reason on screen. */
+  confirmReject(row: MenteeLeaveRow): void {
+    const typed = this.open() === row.id ? this.note().trim() : '';
+    if (this.confirmingReject() !== row.id || !typed) {
+      // The reason went away under the confirmation: ask for it again.
+      this.reject(row);
+      return;
+    }
+    void this.decide(row, 'REJECT', typed);
+  }
+
+  /** "Keep": back out of the confirmation; nothing was sent. */
+  keepRequest(): void {
+    this.confirmingReject.set(null);
+  }
+
   approve(row: MenteeLeaveRow): void {
+    this.confirmingReject.set(null);
     const typed = this.open() === row.id ? this.note().trim() : '';
     void this.decide(row, 'APPROVE', typed || null);
   }
@@ -138,6 +176,7 @@ export class StudentLeaveComponent {
       await this.load();
     } finally {
       this.deciding.set(null);
+      this.confirmingReject.set(null);
     }
   }
 }

@@ -54,6 +54,12 @@ export function leaveStatusTone(status: string): 'good' | 'warn' | 'risk' | 'neu
   return 'neutral';
 }
 
+/** Medical leave is sent only with its supporting document (2026-11-12). The
+ *  server refuses it otherwise (`student_leave.py`); the form says so first. */
+export function documentRequired(kind: string | null | undefined): boolean {
+  return kind === 'MEDICAL';
+}
+
 export function isPending(status: string): boolean {
   return status === 'SUBMITTED' || status === 'FIRST_APPROVED';
 }
@@ -143,8 +149,6 @@ export type MenteeQueueTab = 'PENDING' | 'APPROVED' | 'REJECTED';
 export const leaveApi = {
   myRoute: () => apiJson<LeaveRoute>('/leaves/mine/approver', {}, 'Could not load your details'),
   mine: () => apiJson<LeaveRow[]>('/leaves/mine', {}, 'Could not load your leave'),
-  submit: (body: NewLeave) =>
-    apiJson<LeaveRow>('/leaves', { method: 'POST', body: JSON.stringify(body) }, 'Could not send your request'),
   withdraw: (id: string) =>
     apiJson<LeaveRow>(`/leaves/${id}/cancel`, { method: 'POST' }, 'Could not withdraw the request'),
   menteeQueue: (tab: MenteeQueueTab) =>
@@ -159,22 +163,37 @@ export const leaveApi = {
     ),
 };
 
-/** Attach a supporting document to a request the caller just sent. Throws an
- *  Error whose message is the screen's sentence. */
-export async function attachLeaveDocument(leaveId: string, file: File): Promise<void> {
+/** The multipart body `POST /leaves/student` reads: the four fields, and the
+ *  document as `file` when there is one. */
+export function studentLeaveForm(body: NewLeave, file: File | null): FormData {
   const form = new FormData();
-  form.append('file', file, file.name);
+  form.append('leave_kind', body.leave_kind);
+  form.append('from_date', body.from_date);
+  form.append('to_date', body.to_date);
+  form.append('reason', body.reason);
+  if (file) form.append('file', file, file.name);
+  return form;
+}
+
+/** Send a student's request AND its supporting document in ONE call
+ *  (2026-11-12). The server saves both or neither, so there is no "sent, but
+ *  the document did not upload" any more. Throws an Error whose message is the
+ *  screen's sentence. */
+export async function submitStudentLeave(body: NewLeave, file: File | null): Promise<LeaveRow> {
   let res: Response;
   try {
-    res = await fetch(`${environment.apiBase}/leaves/${leaveId}/attachments`, {
+    res = await fetch(`${environment.apiBase}/leaves/student`, {
       method: 'POST',
       credentials: 'include',
-      body: form,
+      body: studentLeaveForm(body, file),
     });
   } catch {
-    throw new Error(UPLOAD_DROPPED_MESSAGE);
+    throw new Error(
+      file ? UPLOAD_DROPPED_MESSAGE : 'Could not reach the server. Check your connection and try again.',
+    );
   }
-  if (!res.ok) throw new Error(await detailOf(res, 'The document did not upload'));
+  if (!res.ok) throw new Error(await detailOf(res, 'Could not send your request'));
+  return (await res.json()) as LeaveRow;
 }
 
 /** The download URL of one supporting document, for an `<a href download>`. */

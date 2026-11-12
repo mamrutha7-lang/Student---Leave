@@ -4,6 +4,14 @@
     GET    /api/leaves/{id}/attachments              list them
     GET    /api/leaves/{id}/attachments/{aid}/file   download one
     DELETE /api/leaves/{id}/attachments/{aid}        remove one
+    POST   /api/leaves/student                       a student's request AND its
+                                                     document, in one transaction
+
+A STUDENT'S MEDICAL LEAVE AND ITS DOCUMENT (2026-11-12). Medical leave is sent
+only with a supporting document, the two are saved in ONE commit
+(`submit_student_leave`), and the last document on a pending medical request
+cannot be removed by anybody (`_is_last_medical_document`). Faculty leave and
+its papers are unchanged.
 
 ITS OWN MODULE, FOR `app/routers/leave_paper.py`'S REASON. `routers/leave.py`
 holds the form's submit and decide paths, which the owner asked to leave exactly
@@ -79,10 +87,21 @@ the volume.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
-from pydantic import BaseModel
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -101,13 +120,23 @@ from ..document_store import (
 )
 from ..document_store import delete as document_store_delete
 from ..identity import get_current_session
-from ..models.leave import LeaveRequest
+from ..models.leave import LeaveRequest, LeaveStatus
 from ..models.leave_attachment import LeaveAttachment
 from ..models.user import Role, User
+from ..student_leave import MEDICAL
 # The ONE implementation of "may this account see this leave request". Imported
 # from the module that owns it exactly as routers/leave_paper.py imports it; a
-# second copy here would be the copy that stops tracking the first.
-from .leave import _assert_can_decide
+# second copy here would be the copy that stops tracking the first. The submit
+# helpers are imported for the same reason: the student's one-step door
+# (`submit_student_leave`) applies `submit_leave`'s refusals, never a copy.
+from .leave import (
+    LeaveIn,
+    LeaveOut,
+    _assert_can_decide,
+    _leave_out,
+    announce_submitted,
+    build_leave_request,
+)
 
 router = APIRouter(prefix="/leaves", tags=["leave-attachments"])
 
@@ -135,7 +164,42 @@ class LeaveAttachmentOut(BaseModel):
     can_delete: bool
 
 
-def _out(row: LeaveAttachment, *, uploader: User | None, session: dict) -> LeaveAttachmentOut:
+#: A pending request can still be decided, so its document is still evidence.
+PENDING = (LeaveStatus.SUBMITTED, LeaveStatus.FIRST_APPROVED)
+KEEP_MEDICAL_DOCUMENT = (
+    "A pending medical leave request must keep its supporting document. "
+    "Withdraw the request instead if it should not go ahead."
+)
+
+
+def _is_last_medical_document(db: Session, lr: LeaveRequest) -> bool:
+    """Is this a STUDENT's PENDING MEDICAL request holding only ONE document?
+
+    Then that document cannot be removed (2026-11-12), by anybody — the
+    applicant, the Main Admin included. A medical request is only sendable with
+    its document (`student_leave.py`), and removing it afterwards would leave
+    the mentor deciding exactly the request the rule refused. Extra documents
+    can still go, and so can the last one once the request is decided or
+    withdrawn. Faculty requests are not touched: the rule is the student's.
+    """
+    if lr.leave_kind != MEDICAL or lr.status not in PENDING:
+        return False
+    applicant = db.get(User, lr.requester_user_id)
+    if applicant is None or applicant.role != Role.STUDENT:
+        return False
+    count = db.scalar(
+        select(func.count(LeaveAttachment.id)).where(LeaveAttachment.leave_request_id == lr.id)
+    )
+    return (count or 0) <= 1
+
+
+def _out(
+    row: LeaveAttachment,
+    *,
+    uploader: User | None,
+    session: dict,
+    protected: bool = False,
+) -> LeaveAttachmentOut:
     return LeaveAttachmentOut(
         id=row.id,
         leave_request_id=row.leave_request_id,
@@ -145,7 +209,7 @@ def _out(row: LeaveAttachment, *, uploader: User | None, session: dict) -> Leave
         uploaded_at=row.uploaded_at,
         uploaded_by_user_id=row.uploaded_by_user_id,
         uploaded_by_name=uploader.name if uploader else None,
-        can_delete=_may_delete(row, session),
+        can_delete=_may_delete(row, session) and not protected,
     )
 
 
@@ -222,8 +286,15 @@ def list_attachments(
         .order_by(LeaveAttachment.uploaded_at)
     ).all()
     people = _uploaders(db, list(rows))
+    protected = _is_last_medical_document(db, lr)
     return [
-        _out(r, uploader=people.get(r.uploaded_by_user_id or ""), session=session) for r in rows
+        _out(
+            r,
+            uploader=people.get(r.uploaded_by_user_id or ""),
+            session=session,
+            protected=protected,
+        )
+        for r in rows
     ]
 
 
@@ -252,14 +323,37 @@ def upload_attachment(
     """
     lr = _readable_request(db, session, leave_id)
     user_id = session["userId"]
+    row = _store_attachment(db, lr.id, user_id, file)
+    db.commit()
+    db.refresh(row)
+    return _out(
+        row,
+        uploader=db.get(User, user_id),
+        session=session,
+        protected=_is_last_medical_document(db, lr),
+    )
 
+
+def _store_attachment(
+    db: Session, leave_request_id: str, user_id: str, file: UploadFile
+) -> LeaveAttachment:
+    """Check the quota and the file, store the bytes, and add the row — WITHOUT
+    committing. The caller owns the transaction: `upload_attachment` commits
+    straight away, and `submit_student_leave` commits the request and its
+    document together.
+
+    Raises the HTTP refusals (409 / 413 / 422) before anything is written to the
+    volume, so a refused file leaves nothing behind. Once this returns, the bytes
+    ARE on the volume: a caller whose commit then fails must delete
+    `row.stored_name` itself.
+    """
     # PHASE ONE, BEFORE THE BODY IS READ. The file COUNT is this request's, the
     # byte allowance is this uploader's: two owners, one quota object. See the
     # module docstring and document_store's constants.
     used_files = (
         db.scalar(
             select(func.count(LeaveAttachment.id)).where(
-                LeaveAttachment.leave_request_id == lr.id
+                LeaveAttachment.leave_request_id == leave_request_id
             )
         )
         or 0
@@ -305,7 +399,7 @@ def upload_attachment(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
 
     row = LeaveAttachment(
-        leave_request_id=lr.id,
+        leave_request_id=leave_request_id,
         uploaded_by_user_id=user_id,
         original_name=file.filename or stored_name,
         stored_name=stored_name,
@@ -313,9 +407,79 @@ def upload_attachment(
         size_bytes=size,
     )
     db.add(row)
-    db.commit()
-    db.refresh(row)
-    return _out(row, uploader=db.get(User, user_id), session=session)
+    db.flush()
+    return row
+
+
+@router.post("/student", response_model=LeaveOut, status_code=status.HTTP_201_CREATED)
+def submit_student_leave(
+    background: BackgroundTasks,
+    from_date: date = Form(...),
+    to_date: date = Form(...),
+    reason: str = Form(...),
+    leave_kind: str | None = Form(None),
+    file: UploadFile | None = File(None),
+    session: dict = Depends(get_current_session),
+    db: Session = Depends(get_db),
+) -> LeaveOut:
+    """A student's leave request AND its supporting document, in ONE step
+    (2026-11-12).
+
+    Until this date the form posted the request, then attached the file to the
+    id that came back. Every way the second call could fail — a dropped
+    connection, a file the store refused, the tab closed — left a request
+    with no document behind, and the form could only say "sent, but the
+    document did not upload". A MEDICAL request now needs its document
+    (`student_leave.py`), so the two land together or not at all:
+
+      1. every refusal `submit_leave` applies (`build_leave_request`), with the
+         document rule told whether a file came with the call;
+      2. the request row is flushed, so the attachment can point at it;
+      3. the file goes through the same checks and store as any attachment
+         (`_store_attachment`) — a refused file raises BEFORE any bytes are
+         written, and the rollback leaves no request behind;
+      4. ONE commit. If it fails, the bytes just written are deleted, so the
+         volume holds nothing the database does not name;
+      5. the mail, only after the commit — `submit_leave`'s rule.
+
+    Students only: staff apply through `POST /api/leaves` and attach papers to
+    their form separately, exactly as before. A 403 here names no request, so
+    it is not the oracle the module docstring's flattened 404 exists to close.
+    """
+    if session.get("role") != Role.STUDENT.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only students apply for leave here.",
+        )
+    if file is not None and not file.filename:
+        # A browser posts an empty part for a file input nobody filled.
+        file = None
+    try:
+        body = LeaveIn(
+            from_date=from_date, to_date=to_date, reason=reason, leave_kind=leave_kind or None
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=jsonable_encoder(exc.errors(include_url=False, include_context=False)),
+        ) from None
+
+    lr = build_leave_request(db, session, body, with_document=file is not None)
+    db.add(lr)
+    stored_name: str | None = None
+    try:
+        db.flush()
+        if file is not None:
+            stored_name = _store_attachment(db, lr.id, session["userId"], file).stored_name
+        db.commit()
+    except BaseException:
+        db.rollback()
+        if stored_name is not None:
+            document_store_delete(stored_name)
+        raise
+    db.refresh(lr)
+    announce_submitted(db, lr, background)
+    return _leave_out(lr, db)
 
 
 @router.get("/{leave_id}/attachments/{attachment_id}/file")
@@ -374,6 +538,8 @@ def delete_attachment(
                 "Ask the office if it needs to go."
             ),
         )
+    if _is_last_medical_document(db, lr):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=KEEP_MEDICAL_DOCUMENT)
     # RELEASED BEFORE THE BYTES GO, NOT AFTER, AND THE ORDER IS THE WHOLE POINT.
     # `release` runs a SELECT against `archived_documents`. Between an
     # irreversible `unlink` and the commit, ANY failure of that query -- a lock

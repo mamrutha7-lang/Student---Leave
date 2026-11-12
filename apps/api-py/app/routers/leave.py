@@ -395,6 +395,26 @@ def submit_leave(
     the form accepts, and `tests/test_leave_dates.py` submits a deliberately
     overlapping pair to hold that down.
     """
+    lr = build_leave_request(db, session, body, with_document=False)
+    db.add(lr)
+    db.commit()
+    db.refresh(lr)
+    announce_submitted(db, lr, background)
+    return _leave_out(lr, db)
+
+
+def build_leave_request(
+    db: Session, session: dict, body: LeaveIn, *, with_document: bool
+) -> LeaveRequest:
+    """Every refusal a new request can meet, then the unsaved row.
+
+    Shared by the JSON `submit_leave` above and the student's one-step
+    `POST /api/leaves/student` (`routers/leave_attachments.py`), so the two
+    doors cannot disagree about what may be submitted. `with_document` says
+    whether a supporting document arrives in the same call — a student's
+    MEDICAL request is refused without one (`student_leave.py`). Nothing is
+    added to the session: the caller owns the transaction.
+    """
     if session.get("role") == Role.STUDENT.value:
         refusal = student_submit_refusal(
             db,
@@ -402,6 +422,7 @@ def submit_leave(
             leave_kind=body.leave_kind,
             from_date=body.from_date,
             to_date=body.to_date,
+            with_document=with_document,
         )
         if refusal:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=refusal)
@@ -414,7 +435,7 @@ def submit_leave(
     )
     if refusal:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=refusal)
-    lr = LeaveRequest(
+    return LeaveRequest(
         requester_user_id=session["userId"],
         from_date=body.from_date,
         to_date=body.to_date,
@@ -429,9 +450,10 @@ def submit_leave(
         # second call that could never arrive.
         signed_at=datetime.now(timezone.utc),
     )
-    db.add(lr)
-    db.commit()
-    db.refresh(lr)
+
+
+def announce_submitted(db: Session, lr: LeaveRequest, background: BackgroundTasks) -> None:
+    """The mail a new request sends — called only AFTER its commit."""
     # B10.5, AND IT IS OFF UNLESS `LEAVE_MAIL_ENABLED` IS SET. After the commit,
     # never before: `deliver_once` commits its own MailLog, so calling it first
     # would commit a half-written request, and a mail about a request that has
@@ -443,7 +465,6 @@ def submit_leave(
     # faculty. After the response, in its own session: there can be several
     # approvers, and the applicant's button must not wait on a mail server.
     background.add_task(notify_approvers_in_background, lr.id)
-    return _leave_out(lr, db)
 
 
 @router.get("/mine", response_model=list[LeaveOut])

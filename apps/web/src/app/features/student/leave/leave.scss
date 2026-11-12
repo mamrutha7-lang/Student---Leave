@@ -126,6 +126,18 @@
   outline-offset: 2px;
 }
 
+/* Medical leave sent with no document: the field says so on itself, in words
+   as well as colour. */
+.document.invalid .dropzone {
+  border-color: var(--risk);
+}
+
+.field-error {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--risk);
+}
+
 .file-name {
   font-weight: 700;
   color: var(--ink);

@@ -3,8 +3,9 @@
  * placement office when they have none; the server decides which, and the
  * Send button says where (`/leaves/mine/approver`).
  *
- * Two calls, in order: `POST /leaves` creates the request, then the optional
- * supporting document is attached to it (`POST /leaves/{id}/attachments`). The
+ * ONE call (2026-11-12): `POST /leaves/student` carries the request and its
+ * supporting document together, and the server saves both or neither. Medical
+ * leave needs the document; Casual and On official duty may go without. The
  * file is copied into memory when it is picked (`readPickedFile`), so a phone
  * that loses access to it before Send cannot fail the upload halfway.
  *
@@ -20,11 +21,15 @@ import {
   LeaveRoute,
   STUDENT_LEAVE_KINDS,
   StudentLeaveKind,
-  attachLeaveDocument,
+  documentRequired,
   leaveApi,
   leaveKindLabel,
   leaveTotalDays,
+  submitStudentLeave,
 } from '../../../core/leave';
+
+export const DOCUMENT_REQUIRED_MESSAGE =
+  'Medical leave needs a supporting document. Attach your medical certificate.';
 import { UNREADABLE_FILE_MESSAGE, readPickedFile } from '../../../core/picked-file';
 
 /** The same cap the server applies to one stored document (document_store.MAX_BYTES). */
@@ -52,7 +57,12 @@ export class RequestLeaveComponent {
   readonly sending = signal(false);
   readonly error = signal<string | null>(null);
 
+  /** Set when Send was pressed on a medical request with no file, so the
+   *  message sits on the document field itself. */
+  readonly documentError = signal<string | null>(null);
+
   readonly totalDays = computed(() => leaveTotalDays(this.fromDate(), this.toDate()));
+  readonly needsDocument = computed(() => documentRequired(this.kind()));
   readonly sendLabel = computed(() =>
     this.route()?.routed_to === 'OFFICE' ? 'Send to placement office' : 'Send to mentor',
   );
@@ -81,6 +91,7 @@ export class RequestLeaveComponent {
 
   setKind(event: Event): void {
     this.kind.set(this.value(event) as StudentLeaveKind | '');
+    if (!this.needsDocument()) this.documentError.set(null);
   }
 
   async pickFile(event: Event): Promise<void> {
@@ -99,6 +110,7 @@ export class RequestLeaveComponent {
       return;
     }
     this.file.set(copy);
+    this.documentError.set(null);
   }
 
   removeFile(): void {
@@ -111,6 +123,7 @@ export class RequestLeaveComponent {
     if (!this.fromDate() || !this.toDate()) return 'Choose the first and last day of your leave.';
     if (this.toDate() < this.fromDate()) return 'The last day cannot be before the first day.';
     if (!this.reason().trim()) return 'Tell your mentor why you need leave.';
+    if (this.needsDocument() && !this.file()) return DOCUMENT_REQUIRED_MESSAGE;
     return null;
   }
 
@@ -120,31 +133,27 @@ export class RequestLeaveComponent {
     const problem = this.problem();
     if (problem) {
       this.error.set(problem);
+      this.documentError.set(problem === DOCUMENT_REQUIRED_MESSAGE ? problem : null);
+      if (problem === DOCUMENT_REQUIRED_MESSAGE) {
+        document.getElementById('leave-document')?.focus();
+      }
       return;
     }
     this.sending.set(true);
     this.error.set(null);
+    this.documentError.set(null);
     try {
-      const created = await leaveApi.submit({
-        leave_kind: this.kind() as StudentLeaveKind,
-        from_date: this.fromDate(),
-        to_date: this.toDate(),
-        reason: this.reason().trim(),
-      });
-      const document = this.file();
-      if (document) {
-        try {
-          await attachLeaveDocument(created.id, document);
-        } catch (e) {
-          // The request exists and has been sent; only the file is missing.
-          // Say so on the form rather than pretending nothing happened.
-          this.error.set(
-            `Your request was sent, but the document did not upload: ${(e as Error).message} ` +
-              'Withdraw the request on My leave and send it again with the document.',
-          );
-          return;
-        }
-      }
+      // One call: the request and its document are saved together or not at
+      // all, so a failure here means nothing was sent and the form is intact.
+      await submitStudentLeave(
+        {
+          leave_kind: this.kind() as StudentLeaveKind,
+          from_date: this.fromDate(),
+          to_date: this.toDate(),
+          reason: this.reason().trim(),
+        },
+        this.file(),
+      );
       await this.router.navigate(['/student/leave'], {
         queryParams: { sent: this.route()?.routed_to ?? 'MENTOR' },
       });

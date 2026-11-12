@@ -70,22 +70,41 @@
                   {{ open() === row.id ? 'Hide details' : 'Details' }}
                 </button>
                 @if (isPending(row.status)) {
-                  <button
-                    type="button"
-                    class="btn sm danger"
-                    [disabled]="deciding() !== null"
-                    (click)="reject(row)"
-                  >
-                    Reject
-                  </button>
-                  <button
-                    type="button"
-                    class="btn sm primary"
-                    [disabled]="deciding() !== null"
-                    (click)="approve(row)"
-                  >
-                    {{ deciding() === row.id ? 'Saving…' : 'Approve' }}
-                  </button>
+                  @if (confirmingReject() === row.id) {
+                    <button
+                      type="button"
+                      class="btn sm"
+                      [disabled]="deciding() !== null"
+                      (click)="keepRequest()"
+                    >
+                      Keep
+                    </button>
+                    <button
+                      type="button"
+                      class="btn sm danger"
+                      [disabled]="deciding() !== null"
+                      (click)="confirmReject(row)"
+                    >
+                      {{ deciding() === row.id ? 'Rejecting…' : 'Confirm reject' }}
+                    </button>
+                  } @else {
+                    <button
+                      type="button"
+                      class="btn sm danger"
+                      [disabled]="deciding() !== null"
+                      (click)="reject(row)"
+                    >
+                      Reject
+                    </button>
+                    <button
+                      type="button"
+                      class="btn sm primary"
+                      [disabled]="deciding() !== null"
+                      (click)="approve(row)"
+                    >
+                      {{ deciding() === row.id ? 'Saving…' : 'Approve' }}
+                    </button>
+                  }
                 }
               </td>
             </tr>
@@ -117,12 +136,17 @@
                         maxlength="1000"
                         placeholder="Required to reject, optional to approve"
                         [value]="note()"
-                        (input)="note.set($any($event.target).value); noteError.set(null)"
+                        (input)="setNote($any($event.target).value)"
                         [attr.aria-invalid]="noteError() ? 'true' : null"
                         [attr.aria-describedby]="noteError() ? 'leave-note-error-' + row.id : null"
                       ></textarea>
                       @if (noteError(); as problem) {
                         <div class="note-error" role="alert" [id]="'leave-note-error-' + row.id">{{ problem }}</div>
+                      }
+                      @if (confirmingReject() === row.id) {
+                        <div class="note-confirm" role="status">
+                          Reject {{ row.requester_name }}'s request with this reason? The student reads it.
+                        </div>
                       }
                     </div>
                   } @else if (row.director_note) {

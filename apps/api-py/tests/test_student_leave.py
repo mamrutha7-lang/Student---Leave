@@ -16,21 +16,37 @@ What this module holds down:
    official duty; two live requests for one day are refused; the student
    withdraws their own pending request; the supporting document reaches the
    mentor.
+5. MEDICAL LEAVE AND ITS DOCUMENT (2026-11-12): a medical request is sent only
+   with its document, through `POST /leaves/student`, which saves the two in
+   one transaction — a refused file or a failed commit leaves no request and
+   no bytes behind — and the last document on a pending medical request
+   cannot be removed by anybody, the Main Admin included.
 """
 
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
 
 from conftest import APPLICATION_CV, requires_db
 
+from app import document_store
 from app.db import SessionLocal
 from app.models.leave import LeaveRequest
+from app.models.leave_attachment import LeaveAttachment
 from app.models.user import Mentor, Role, Student, User
+from app.routers import leave_attachments
 
 LEAVES = "/api/leaves"
+STUDENT_DOOR = f"{LEAVES}/student"
 APPROVE = {"decision": "APPROVE", "note": None}
+MEDICAL_FORM = {
+    "from_date": "2026-12-14",
+    "to_date": "2026-12-15",
+    "reason": "Fever, the doctor advised two days of rest.",
+    "leave_kind": "MEDICAL",
+}
 
 
 def _student_id(user_id: str) -> str:
@@ -58,16 +74,53 @@ def _unseat(student_user_id: str) -> None:
 
 
 def _submit(client, headers, **extra) -> dict:
+    """A request through the JSON door. CASUAL by default: a student's MEDICAL
+    request needs its document and goes through `_submit_medical`."""
     body = {
         "from_date": "2026-12-14",
         "to_date": "2026-12-15",
-        "reason": "Fever, the doctor advised two days of rest.",
-        "leave_kind": "MEDICAL",
+        "reason": "Family function out of town.",
+        "leave_kind": "CASUAL",
     }
     body.update(extra)
     r = client.post(LEAVES, headers=headers, json=body)
     assert r.status_code == 201, r.text
     return r.json()
+
+
+def _submit_medical(client, headers, **extra) -> dict:
+    """A MEDICAL request and its certificate, in one call."""
+    r = client.post(
+        STUDENT_DOOR,
+        headers=headers,
+        data={**MEDICAL_FORM, **extra},
+        files={"file": ("certificate.pdf", APPLICATION_CV, "application/pdf")},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _counts(user_id: str) -> tuple[int, int]:
+    """(leave requests, attachments) this account has."""
+    with SessionLocal() as db:
+        requests = db.scalar(
+            select(func.count(LeaveRequest.id)).where(LeaveRequest.requester_user_id == user_id)
+        )
+        files = db.scalar(
+            select(func.count(LeaveAttachment.id)).where(
+                LeaveAttachment.uploaded_by_user_id == user_id
+            )
+        )
+        return requests or 0, files or 0
+
+
+def _attachments(leave_id: str) -> list[LeaveAttachment]:
+    with SessionLocal() as db:
+        return list(
+            db.scalars(
+                select(LeaveAttachment).where(LeaveAttachment.leave_request_id == leave_id)
+            ).all()
+        )
 
 
 def _ids(response) -> set[str]:
@@ -88,6 +141,14 @@ def people(make_user):
     _seat(others_mentee.user_id, other.user_id)
     yield {"student": student, "mentor": mentor, "other": other, "office": office}
     with SessionLocal() as db:
+        # The bytes first: the rows cascade with their request, and a row is
+        # the last pointer to its file.
+        for name in db.scalars(
+            select(LeaveAttachment.stored_name)
+            .join(LeaveRequest, LeaveRequest.id == LeaveAttachment.leave_request_id)
+            .where(LeaveRequest.requester_user_id.in_([student.user_id, others_mentee.user_id]))
+        ).all():
+            document_store.delete(name)
         db.execute(
             delete(LeaveRequest).where(
                 LeaveRequest.requester_user_id.in_([student.user_id, others_mentee.user_id])
@@ -166,7 +227,7 @@ def test_the_mentor_rejects_with_a_reason_the_student_reads(client, people):
 @requires_db
 def test_an_approval_note_is_optional_and_reaches_the_student(client, people):
     student, mentor = people["student"], people["mentor"]
-    leave_id = _submit(client, student.headers, leave_kind="MEDICAL")["id"]
+    leave_id = _submit_medical(client, student.headers)["id"]
     note = "Bring the medical certificate when you return."
     r = client.post(
         f"{LEAVES}/{leave_id}/decision",
@@ -285,27 +346,173 @@ def test_the_supporting_document_reaches_the_mentor_and_nobody_else(client, peop
     student, mentor, other, office = (
         people["student"], people["mentor"], people["other"], people["office"]
     )
-    leave_id = _submit(client, student.headers)["id"]
-    up = client.post(
+    leave_id = _submit_medical(client, student.headers)["id"]
+    [attachment] = _attachments(leave_id)
+    row = next(
+        r for r in client.get(f"{LEAVES}/mentees", headers=mentor.headers).json()
+        if r["id"] == leave_id
+    )
+    assert row["attachments"] == [{"id": attachment.id, "original_name": "certificate.pdf"}]
+    assert row["requester_usn"] is None  # make_user's student has no USN
+    url = f"{LEAVES}/{leave_id}/attachments/{attachment.id}/file"
+    assert client.get(url, headers=mentor.headers).status_code == 200
+    assert client.get(url, headers=other.headers).status_code == 404
+    assert client.get(url, headers=office.headers).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# 5. Medical leave and its document (2026-11-12)
+# --------------------------------------------------------------------------- #
+
+
+@requires_db
+def test_medical_leave_is_refused_without_its_document_on_both_doors(client, people):
+    student = people["student"]
+    before = _counts(student.user_id)
+
+    json_door = client.post(LEAVES, headers=student.headers, json=MEDICAL_FORM)
+    assert json_door.status_code == 422, json_door.text
+    assert "Medical leave needs a supporting document" in json_door.text
+
+    no_file = client.post(STUDENT_DOOR, headers=student.headers, data=MEDICAL_FORM)
+    assert no_file.status_code == 422, no_file.text
+    assert "Medical leave needs a supporting document" in no_file.text
+
+    assert _counts(student.user_id) == before
+
+
+@requires_db
+def test_medical_leave_and_its_document_are_saved_together(client, people):
+    student = people["student"]
+    created = _submit_medical(client, student.headers)
+    assert created["status"] == "SUBMITTED" and created["leave_kind"] == "MEDICAL"
+    [attachment] = _attachments(created["id"])
+    assert attachment.original_name == "certificate.pdf"
+    assert attachment.uploaded_by_user_id == student.user_id
+    assert document_store.read_bytes(attachment.stored_name) == APPLICATION_CV
+
+
+@requires_db
+def test_casual_and_ood_leave_may_still_go_without_a_document(client, people):
+    student = people["student"]
+    r = client.post(
+        STUDENT_DOOR,
+        headers=student.headers,
+        data={**MEDICAL_FORM, "leave_kind": "OOD"},
+    )
+    assert r.status_code == 201, r.text
+    assert _attachments(r.json()["id"]) == []
+
+
+@requires_db
+def test_a_refused_document_leaves_no_request_behind(client, people):
+    student = people["student"]
+    before = _counts(student.user_id)
+    r = client.post(
+        STUDENT_DOOR,
+        headers=student.headers,
+        data=MEDICAL_FORM,
+        files={"file": ("certificate.pdf", b"not really a pdf", "application/pdf")},
+    )
+    assert r.status_code == 422, r.text
+    assert _counts(student.user_id) == before
+
+
+@requires_db
+def test_a_failed_commit_deletes_the_bytes_it_wrote(client, people, monkeypatch):
+    """The file is on the volume before the commit; if the commit fails, the
+    endpoint must delete it, or the volume holds a certificate nothing names."""
+    student = people["student"]
+    before = _counts(student.user_id)
+    deleted: list[str] = []
+    real_delete = leave_attachments.document_store_delete
+
+    def record_delete(name: str) -> None:
+        deleted.append(name)
+        real_delete(name)
+
+    def failing_commit(self) -> None:
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(leave_attachments, "document_store_delete", record_delete)
+    monkeypatch.setattr(Session, "commit", failing_commit)
+    with pytest.raises(RuntimeError, match="database went away"):
+        client.post(
+            STUDENT_DOOR,
+            headers=student.headers,
+            data=MEDICAL_FORM,
+            files={"file": ("certificate.pdf", APPLICATION_CV, "application/pdf")},
+        )
+    monkeypatch.undo()
+
+    assert len(deleted) == 1
+    with pytest.raises(FileNotFoundError):
+        document_store.read_bytes(deleted[0])
+    assert _counts(student.user_id) == before
+
+
+@requires_db
+def test_staff_do_not_use_the_student_door(client, people):
+    r = client.post(
+        STUDENT_DOOR,
+        headers=people["mentor"].headers,
+        data={**MEDICAL_FORM, "leave_kind": "CASUAL"},
+    )
+    assert r.status_code == 403, r.text
+
+
+@requires_db
+def test_the_document_stays_on_a_pending_medical_request(client, people):
+    """Nobody removes the last document of a pending medical request: not the
+    student who attached it, not the Main Admin. Once it is decided, it can go."""
+    student, mentor, office = people["student"], people["mentor"], people["office"]
+    _unseat(student.user_id)  # the office's request, so the Main Admin can reach it
+    leave_id = _submit_medical(client, student.headers)["id"]
+    [attachment] = _attachments(leave_id)
+    url = f"{LEAVES}/{leave_id}/attachments/{attachment.id}"
+
+    listed = client.get(f"{LEAVES}/{leave_id}/attachments", headers=student.headers).json()
+    assert [a["can_delete"] for a in listed] == [False]
+    for headers in (student.headers, office.headers):
+        refused = client.delete(url, headers=headers)
+        assert refused.status_code == 409, refused.text
+        assert "must keep its supporting document" in refused.text
+    assert len(_attachments(leave_id)) == 1
+
+    decided = client.post(f"{LEAVES}/{leave_id}/decision", headers=office.headers, json=APPROVE)
+    assert decided.status_code == 200, decided.text
+    assert client.delete(url, headers=student.headers).status_code == 204
+
+
+@requires_db
+def test_an_extra_document_may_still_be_removed(client, people):
+    student = people["student"]
+    leave_id = _submit_medical(client, student.headers)["id"]
+    extra = client.post(
         f"{LEAVES}/{leave_id}/attachments",
         headers=student.headers,
-        files={"file": ("certificate.pdf", APPLICATION_CV, "application/pdf")},
+        files={"file": ("second-page.pdf", APPLICATION_CV, "application/pdf")},
     )
-    assert up.status_code == 201, up.text
-    attachment_id = up.json()["id"]
-    try:
-        row = next(
-            r for r in client.get(f"{LEAVES}/mentees", headers=mentor.headers).json()
-            if r["id"] == leave_id
-        )
-        assert row["attachments"] == [{"id": attachment_id, "original_name": "certificate.pdf"}]
-        assert row["requester_usn"] is None  # make_user's student has no USN
-        url = f"{LEAVES}/{leave_id}/attachments/{attachment_id}/file"
-        assert client.get(url, headers=mentor.headers).status_code == 200
-        assert client.get(url, headers=other.headers).status_code == 404
-        assert client.get(url, headers=office.headers).status_code == 404
-    finally:
-        client.delete(f"{LEAVES}/{leave_id}/attachments/{attachment_id}", headers=student.headers)
+    assert extra.status_code == 201, extra.text
+    gone = client.delete(
+        f"{LEAVES}/{leave_id}/attachments/{extra.json()['id']}", headers=student.headers
+    )
+    assert gone.status_code == 204, gone.text
+    [last] = _attachments(leave_id)
+    assert client.delete(
+        f"{LEAVES}/{leave_id}/attachments/{last.id}", headers=student.headers
+    ).status_code == 409
+
+
+@requires_db
+def test_a_withdrawn_medical_request_lets_its_document_go(client, people):
+    student = people["student"]
+    leave_id = _submit_medical(client, student.headers)["id"]
+    [attachment] = _attachments(leave_id)
+    assert client.post(f"{LEAVES}/{leave_id}/cancel", headers=student.headers).status_code == 200
+    assert client.delete(
+        f"{LEAVES}/{leave_id}/attachments/{attachment.id}", headers=student.headers
+    ).status_code == 204
 
 
 @requires_db
